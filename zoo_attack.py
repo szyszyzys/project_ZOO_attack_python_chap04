@@ -32,15 +32,20 @@ z = model(image)
 # z.size() :   (1, 10)  10 elements are corresponding to classes
 
 '''
+
+# attack hyper parameters
 attack_hparams = {
     'lr': 0.01,
-    'num_epochs': 1000,
+    'c_search_round': 1000,
     'initial_const': 0.001,
     'max_iteration': 1000,
     'transfer_param': 0.0,
 }
 
-
+'''
+calculate the second part of loss function 
+in targeted attack: other_logits - class_logits
+'''
 def get_partial_loss(output, labels, labels_infhot=None):
     if labels_infhot is None:
         labels_infhot = torch.zeros_like(output).scatter_(1, labels.unsqueeze(1), float('inf'))
@@ -71,44 +76,49 @@ def zoo_attack(network, image, t_0):
     batch_view = lambda tensor: tensor.view(batch_size, *[1] * (image.ndim - 1))
     t_image = (image * 2).sub_(1).mul_(1 - 1e-6).atanh_()
 
-    # setup regularization parameter c
-    # lower_bound, upper_bound, use binary search to find the optimal c
+    # setup regularization parameter c, initialization
+    # lower_bound, upper_bound: use binary search to find the optimal c
     c = torch.full((1,), attack_hparams['initial_const'], device=device)
     lower_bound = torch.zeros_like(c)
     upper_bound = torch.full_like(c, 1e10)
 
-    o_best_l2 = torch.full_like(c, float('inf'))
-    o_best_adv = image.clone()
-    o_adv_found = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    # save the best result for output
+    global_best_l2 = torch.full_like(c, float('inf'))
+    # best adversarial example
+    global_best_adv = image.clone()
+    # if found an adversarial example
+    global_adv_found = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    # tools for calculate loss
     labels_onehot = None
     labels_infhot = None
 
-    attack_epochs = attack_hparams['num_epochs']
+    c_search_round = attack_hparams['c_search_round']
     attack_iterations = attack_hparams['max_iterations']
-    for epoch in range(attack_epochs):
-        # setup the modifier and the optimizer
+    for cur_round in range(c_search_round):
+        # setup the modifier and the optimizer, modifier is the perturbation to the image
         modifier = torch.zeros_like(image, requires_grad=True)
         optimizer = optim.Adam([modifier], lr=attack_hparams['lr'])
+        # best result with current regularization parameter c
         best_l2 = torch.full_like(c, float('inf'))
         adv_found = torch.zeros(1, device=device, dtype=torch.bool)
 
         # The last iteration (if we run many steps) repeat the search once.
-        if (attack_epochs >= 10) and epoch == (attack_epochs - 1):
+        if (c_search_round >= 10) and cur_round == (c_search_round - 1):
             c = upper_bound
-        # record previous result to avoid stuck
+        # early stop: record previous result to avoid stuck
         prev = float('inf')
 
         for i in range(attack_iterations):
             # generate the adversarial example
             adv_inputs = (torch.tanh(t_image + modifier) + 1) / 2
-            # calculate similarity
+            # calculate the distance between AE and original image, first part of the loss function
             l2_squared = (adv_inputs - image).flatten(1).square().sum(1)
             l2 = l2_squared.detach().sqrt()
-            # get model output
+            # get model output on AE
             output = model(adv_inputs)
 
-            # in first run, setup the target variable, we need it to be in one-hot form for the loss function
-            if epoch == 0 and i == 0:
+            # in first run, setup the target variable for the loss function
+            if cur_round == 0 and i == 0:
                 labels_onehot = torch.zeros_like(output).scatter_(1, labels.unsqueeze(1), 1)
                 labels_infhot = torch.zeros_like(output).scatter_(1, labels.unsqueeze(1), float('inf'))
 
@@ -116,10 +126,11 @@ def zoo_attack(network, image, t_0):
             prediction = (output + labels_onehot * transfer_param).argmax(1)
             # check if current image is an adversarial example
             is_adv = prediction != labels
-            # get the most similar AE
+            # record the most similar AE
             is_smaller = l2 < best_l2
-            o_is_smaller = l2 < o_best_l2
-            # in the case the image is an AE and the difference is low
+            # compare current AE with the global best
+            o_is_smaller = l2 < global_best_l2
+            #
             is_both = is_adv & is_smaller
             o_is_both = is_adv & o_is_smaller
 
@@ -128,9 +139,9 @@ def zoo_attack(network, image, t_0):
             adv_found.logical_or_(is_both)
 
             # update the global best and save the best AE
-            o_best_l2 = torch.where(o_is_both, l2, o_best_l2)
-            o_adv_found.logical_or_(is_both)
-            o_best_adv = torch.where(batch_view(o_is_both), adv_inputs.detach(), o_best_adv)
+            global_best_l2 = torch.where(o_is_both, l2, global_best_l2)
+            global_adv_found.logical_or_(is_both)
+            global_best_adv = torch.where(batch_view(o_is_both), adv_inputs.detach(), global_best_adv)
 
             # calculate the loss
             partial_loss = get_partial_loss(output, labels, labels_infhot=labels_infhot)
@@ -156,7 +167,7 @@ def zoo_attack(network, image, t_0):
         c[(~is_smaller) & adv_not_found] *= 10
 
     # return the best adv
-    return o_best_adv
+    return global_best_adv
 
 
 # test the performance of attack
